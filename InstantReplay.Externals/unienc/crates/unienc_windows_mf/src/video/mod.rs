@@ -1,9 +1,7 @@
 use crate::error::{WindowsError, Result};
 use bincode::{Decode, Encode};
 use tokio::sync::mpsc;
-use unienc_common::{
-    EncodedData, Encoder, EncoderInput, EncoderOutput, UniencSampleKind, UnsupportedBlitData, VideoEncoderOptions, VideoFrame, VideoSample
-};
+use unienc_common::{EncodedData, Encoder, EncoderInput, EncoderOutput, Runtime, UniencSampleKind, UnsupportedBlitData, VideoEncoderOptions, VideoFrame, VideoSample};
 use windows::Win32::Media::MediaFoundation::*;
 
 use crate::common::*;
@@ -16,7 +14,7 @@ pub struct MediaFoundationVideoEncoder {
 }
 
 impl MediaFoundationVideoEncoder {
-    pub fn new<V: VideoEncoderOptions>(options: &V) -> Result<Self> {
+    pub fn new<V: VideoEncoderOptions>(options: &V, runtime: &impl Runtime) -> Result<Self> {
         let input_type = unsafe {
             let input_type = MFCreateMediaType()?;
             input_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -59,6 +57,7 @@ impl MediaFoundationVideoEncoder {
             },
             input_type,
             output_type,
+            runtime,
         )?;
 
         Ok(Self {
@@ -105,18 +104,18 @@ impl EncoderInput for VideoEncoderInputImpl {
         let VideoFrame::Bgra32(frame) = data.frame else {
             return Err(WindowsError::UnsupportedVideoFrameFormat.into());
         };
-        let sample = UnsafeSend(unsafe { MFCreateSample()? });
+        let sample = UnsafeSend(unsafe { MFCreateSample().map_err(WindowsError::from)? });
 
         // BGRA to NV12
         {
             let (y, u, v) = frame.to_yuv420_planes(None)?;
             let length = (y.len() + u.len() + v.len()) as u32;
-            let buffer = unsafe { MFCreateMemoryBuffer(length)? };
+            let buffer = unsafe { MFCreateMemoryBuffer(length).map_err(WindowsError::from)? };
 
-            unsafe { sample.AddBuffer(&buffer)? };
+            unsafe { sample.AddBuffer(&buffer).map_err(WindowsError::from)? };
 
             let mut buffer_ptr: *mut u8 = std::ptr::null_mut();
-            unsafe { buffer.Lock(&mut buffer_ptr, None, None)? };
+            unsafe { buffer.Lock(&mut buffer_ptr, None, None).map_err(WindowsError::from)? };
 
             unsafe {
                 std::ptr::copy_nonoverlapping(y.as_ptr(), buffer_ptr, y.len());
@@ -129,14 +128,14 @@ impl EncoderInput for VideoEncoderInputImpl {
                 }
             }
 
-            unsafe { buffer.SetCurrentLength(length)? }
+            unsafe { buffer.SetCurrentLength(length).map_err(WindowsError::from)? }
 
-            unsafe { buffer.Unlock()? };
+            unsafe { buffer.Unlock().map_err(WindowsError::from)? };
         }
 
-        unsafe { sample.SetSampleTime((data.timestamp * 10_000_000_f64) as i64)? };
-        unsafe { sample.SetSampleDuration((1.0_f64 / self.fps_hint * 10_000_000_f64) as i64)? };
-        self.transform.push(sample).await
+        unsafe { sample.SetSampleTime((data.timestamp * 10_000_000_f64) as i64).map_err(WindowsError::from)? };
+        unsafe { sample.SetSampleDuration((1.0_f64 / self.fps_hint * 10_000_000_f64) as i64).map_err(WindowsError::from)? };
+        Ok(self.transform.push(sample).await?)
     }
 }
 
